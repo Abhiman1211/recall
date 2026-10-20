@@ -1,0 +1,779 @@
+openapi: 3.1.0
+info:
+  title: Recall API
+  version: 0.1.0
+  summary: Personal knowledge assistant with retrieval-augmented answers.
+  description: |
+    REST API for the Recall iOS app. Users upload documents (PDF, web page, scan, note),
+    the backend ingests them into a vector index, and users ask questions that are answered
+    by Claude with citations back to source passages.
+
+    Conventions
+    - All endpoints except `/v1/auth/*` and health checks require a Bearer access token.
+    - Errors use RFC 9457 `application/problem+json`.
+    - List endpoints use cursor pagination (`cursor`, `limit`; response carries `next_cursor`).
+    - POST endpoints that create resources accept an optional `Idempotency-Key` header.
+    - Requests are rate limited per user; a 429 carries a `Retry-After` header.
+servers:
+  - url: http://localhost:8000
+    description: Local (docker compose)
+  - url: https://api.recall.example.com
+    description: Production (placeholder)
+tags:
+  - name: Health
+  - name: Auth
+  - name: Collections
+  - name: Documents
+  - name: Conversations
+  - name: Smart actions
+security:
+  - bearerAuth: []
+
+paths:
+  /healthz:
+    get:
+      tags: [Health]
+      operationId: getLiveness
+      summary: Liveness probe
+      security: []
+      responses:
+        '200':
+          description: Process is up
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HealthStatus' }
+
+  /readyz:
+    get:
+      tags: [Health]
+      operationId: getReadiness
+      summary: Readiness probe (database and Redis reachable)
+      security: []
+      responses:
+        '200':
+          description: Ready to serve traffic
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HealthStatus' }
+        '503':
+          $ref: '#/components/responses/Problem'
+
+  /v1/auth/apple:
+    post:
+      tags: [Auth]
+      operationId: signInWithApple
+      summary: Exchange an Apple identity token for Recall tokens
+      description: Verifies the identity token against Apple's public keys, creates the user on first sign-in, and returns an access/refresh token pair.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AppleSignInRequest' }
+      responses:
+        '200':
+          description: Signed in
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TokenPair' }
+        '401':
+          $ref: '#/components/responses/Problem'
+        '422':
+          $ref: '#/components/responses/Problem'
+
+  /v1/auth/refresh:
+    post:
+      tags: [Auth]
+      operationId: refreshTokens
+      summary: Rotate tokens
+      description: Refresh tokens are single use. Reusing one revokes the whole token family.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RefreshRequest' }
+      responses:
+        '200':
+          description: New token pair
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TokenPair' }
+        '401':
+          $ref: '#/components/responses/Problem'
+
+  /v1/me:
+    get:
+      tags: [Auth]
+      operationId: getCurrentUser
+      summary: Current user profile
+      responses:
+        '200':
+          description: The signed-in user
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/User' }
+        '401':
+          $ref: '#/components/responses/Problem'
+
+  /v1/collections:
+    get:
+      tags: [Collections]
+      operationId: listCollections
+      summary: List collections
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: A page of collections
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CollectionPage' }
+        '401':
+          $ref: '#/components/responses/Problem'
+    post:
+      tags: [Collections]
+      operationId: createCollection
+      summary: Create a collection
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CollectionCreate' }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Collection' }
+        '401':
+          $ref: '#/components/responses/Problem'
+        '422':
+          $ref: '#/components/responses/Problem'
+
+  /v1/collections/{collectionId}:
+    parameters:
+      - $ref: '#/components/parameters/CollectionId'
+    patch:
+      tags: [Collections]
+      operationId: updateCollection
+      summary: Rename a collection
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CollectionCreate' }
+      responses:
+        '200':
+          description: Updated
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Collection' }
+        '404':
+          $ref: '#/components/responses/Problem'
+    delete:
+      tags: [Collections]
+      operationId: deleteCollection
+      summary: Delete a collection
+      description: Documents in the collection are kept and become unfiled.
+      responses:
+        '204':
+          description: Deleted
+        '404':
+          $ref: '#/components/responses/Problem'
+
+  /v1/documents:
+    get:
+      tags: [Documents]
+      operationId: listDocuments
+      summary: List documents with ingestion status
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+        - name: collection_id
+          in: query
+          schema: { type: string, format: uuid }
+        - name: status
+          in: query
+          schema: { $ref: '#/components/schemas/DocumentStatus' }
+      responses:
+        '200':
+          description: A page of documents, newest first
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DocumentPage' }
+        '401':
+          $ref: '#/components/responses/Problem'
+    post:
+      tags: [Documents]
+      operationId: createDocument
+      summary: Create a document and get a presigned upload URL
+      description: |
+        Step 1 of upload. The client PUTs the file bytes to `upload.url` directly (S3),
+        then calls `POST /v1/documents/{documentId}/complete`.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/DocumentCreate' }
+      responses:
+        '201':
+          description: Document record created in `uploaded` state awaiting bytes
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DocumentUploadTicket' }
+        '413':
+          $ref: '#/components/responses/Problem'
+        '422':
+          $ref: '#/components/responses/Problem'
+
+  /v1/documents/url:
+    post:
+      tags: [Documents]
+      operationId: createDocumentFromUrl
+      summary: Ingest a web page by URL
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/DocumentFromUrl' }
+      responses:
+        '202':
+          description: Accepted; ingestion queued
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Document' }
+        '422':
+          $ref: '#/components/responses/Problem'
+
+  /v1/documents/{documentId}:
+    parameters:
+      - $ref: '#/components/parameters/DocumentId'
+    get:
+      tags: [Documents]
+      operationId: getDocument
+      summary: Document detail
+      responses:
+        '200':
+          description: The document
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Document' }
+        '404':
+          $ref: '#/components/responses/Problem'
+    patch:
+      tags: [Documents]
+      operationId: updateDocument
+      summary: Rename or move a document
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/DocumentUpdate' }
+      responses:
+        '200':
+          description: Updated
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Document' }
+        '404':
+          $ref: '#/components/responses/Problem'
+    delete:
+      tags: [Documents]
+      operationId: deleteDocument
+      summary: Delete a document, its chunks and stored file
+      responses:
+        '204':
+          description: Deleted
+        '404':
+          $ref: '#/components/responses/Problem'
+
+  /v1/documents/{documentId}/complete:
+    parameters:
+      - $ref: '#/components/parameters/DocumentId'
+    post:
+      tags: [Documents]
+      operationId: completeDocumentUpload
+      summary: Mark the upload done and queue ingestion
+      responses:
+        '202':
+          description: Ingestion queued; status moves to `processing`
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Document' }
+        '404':
+          $ref: '#/components/responses/Problem'
+        '409':
+          $ref: '#/components/responses/Problem'
+
+  /v1/documents/{documentId}/chunks/{chunkId}:
+    parameters:
+      - $ref: '#/components/parameters/DocumentId'
+      - name: chunkId
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    get:
+      tags: [Documents]
+      operationId: getChunk
+      summary: Fetch one source passage (used when a citation is tapped)
+      responses:
+        '200':
+          description: The passage
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Chunk' }
+        '404':
+          $ref: '#/components/responses/Problem'
+
+  /v1/documents/{documentId}/flashcards:
+    parameters:
+      - $ref: '#/components/parameters/DocumentId'
+    post:
+      tags: [Smart actions]
+      operationId: generateFlashcards
+      summary: Generate flashcards from a document
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/FlashcardRequest' }
+      responses:
+        '200':
+          description: Generated flashcards
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/FlashcardSet' }
+        '409':
+          $ref: '#/components/responses/Problem'
+
+  /v1/conversations:
+    get:
+      tags: [Conversations]
+      operationId: listConversations
+      summary: List conversations, most recent first
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: A page of conversations
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ConversationPage' }
+    post:
+      tags: [Conversations]
+      operationId: createConversation
+      summary: Start a conversation, optionally scoped to one collection
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ConversationCreate' }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Conversation' }
+
+  /v1/conversations/{conversationId}:
+    parameters:
+      - $ref: '#/components/parameters/ConversationId'
+    delete:
+      tags: [Conversations]
+      operationId: deleteConversation
+      summary: Delete a conversation and its messages
+      responses:
+        '204':
+          description: Deleted
+        '404':
+          $ref: '#/components/responses/Problem'
+
+  /v1/conversations/{conversationId}/messages:
+    parameters:
+      - $ref: '#/components/parameters/ConversationId'
+    get:
+      tags: [Conversations]
+      operationId: listMessages
+      summary: Message history, oldest first
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: A page of messages
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MessagePage' }
+    post:
+      tags: [Conversations]
+      operationId: askQuestion
+      summary: Ask a question and stream the answer
+      description: |
+        Returns a Server-Sent Events stream. Event types, in order:
+
+        - `message.start` with `{ "message_id": "<uuid>" }`
+        - `token` (repeated) with `{ "text": "<delta>" }`
+        - `citation` (zero or more) with a `Citation` object
+        - `message.done` with a `MessageUsage` object
+        - `error` with a Problem object, after which the stream closes
+
+        Send `Accept: application/json` instead to receive the finished `Message` in one response.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/QuestionCreate' }
+      responses:
+        '200':
+          description: Answer stream (or full message when Accept is application/json)
+          content:
+            text/event-stream:
+              schema:
+                type: string
+                description: SSE frames as described above.
+              example: |
+                event: message.start
+                data: {"message_id":"0b7c0f3e-6f1a-4a77-9a55-2b8f7d1d9c10"}
+
+                event: token
+                data: {"text":"Recall uses hybrid search"}
+
+                event: citation
+                data: {"index":1,"document_id":"5d1e...","chunk_id":"9a2f...","page":4,"snippet":"Hybrid retrieval combines..."}
+
+                event: message.done
+                data: {"input_tokens":2140,"output_tokens":312,"latency_ms":1830}
+            application/json:
+              schema: { $ref: '#/components/schemas/Message' }
+        '404':
+          $ref: '#/components/responses/Problem'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  parameters:
+    Cursor:
+      name: cursor
+      in: query
+      description: Opaque cursor from a previous page's `next_cursor`.
+      schema: { type: string }
+    Limit:
+      name: limit
+      in: query
+      schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      description: Client-generated UUID; retries with the same key return the original result.
+      schema: { type: string, format: uuid }
+    CollectionId:
+      name: collectionId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    DocumentId:
+      name: documentId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    ConversationId:
+      name: conversationId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+
+  responses:
+    Problem:
+      description: Error (RFC 9457)
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    RateLimited:
+      description: Too many requests
+      headers:
+        Retry-After:
+          description: Seconds to wait before retrying.
+          schema: { type: integer }
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+
+  schemas:
+    Problem:
+      type: object
+      required: [type, title, status]
+      properties:
+        type: { type: string, format: uri, example: 'https://recall.example.com/problems/not-found' }
+        title: { type: string, example: Document not found }
+        status: { type: integer, example: 404 }
+        detail: { type: string }
+        instance: { type: string }
+
+    HealthStatus:
+      type: object
+      required: [status]
+      properties:
+        status: { type: string, enum: [ok, degraded] }
+        checks:
+          type: object
+          additionalProperties: { type: string }
+
+    AppleSignInRequest:
+      type: object
+      required: [identity_token]
+      properties:
+        identity_token: { type: string, description: JWT from ASAuthorizationAppleIDCredential }
+        full_name: { type: [string, 'null'], description: Only sent by Apple on first sign-in }
+
+    RefreshRequest:
+      type: object
+      required: [refresh_token]
+      properties:
+        refresh_token: { type: string }
+
+    TokenPair:
+      type: object
+      required: [access_token, refresh_token, token_type, expires_in]
+      properties:
+        access_token: { type: string }
+        refresh_token: { type: string }
+        token_type: { type: string, const: Bearer }
+        expires_in: { type: integer, description: Access token lifetime in seconds, example: 900 }
+
+    User:
+      type: object
+      required: [id, created_at]
+      properties:
+        id: { type: string, format: uuid }
+        email: { type: [string, 'null'], format: email }
+        display_name: { type: [string, 'null'] }
+        created_at: { type: string, format: date-time }
+
+    Collection:
+      type: object
+      required: [id, name, document_count, created_at]
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        document_count: { type: integer }
+        created_at: { type: string, format: date-time }
+
+    CollectionCreate:
+      type: object
+      required: [name]
+      properties:
+        name: { type: string, minLength: 1, maxLength: 80 }
+
+    CollectionPage:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/Collection' }
+        next_cursor: { type: [string, 'null'] }
+
+    SourceType:
+      type: string
+      enum: [pdf, url, scan, note]
+
+    DocumentStatus:
+      type: string
+      enum: [uploaded, processing, ready, failed]
+      description: |
+        uploaded -> processing (on /complete) -> ready | failed.
+        A failed document can be retried by calling /complete again.
+
+    Document:
+      type: object
+      required: [id, title, source_type, status, created_at, updated_at]
+      properties:
+        id: { type: string, format: uuid }
+        collection_id: { type: [string, 'null'], format: uuid }
+        title: { type: string }
+        source_type: { $ref: '#/components/schemas/SourceType' }
+        source_url: { type: [string, 'null'], format: uri }
+        status: { $ref: '#/components/schemas/DocumentStatus' }
+        page_count: { type: [integer, 'null'] }
+        chunk_count: { type: [integer, 'null'] }
+        error: { type: [string, 'null'], description: Set when status is failed }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+
+    DocumentCreate:
+      type: object
+      required: [title, source_type, content_type, size_bytes]
+      properties:
+        title: { type: string, minLength: 1, maxLength: 200 }
+        source_type:
+          type: string
+          enum: [pdf, scan, note]
+        content_type:
+          type: string
+          enum: [application/pdf, text/plain, text/markdown]
+        size_bytes: { type: integer, minimum: 1, maximum: 52428800, description: Max 50 MB }
+        collection_id: { type: [string, 'null'], format: uuid }
+
+    DocumentFromUrl:
+      type: object
+      required: [url]
+      properties:
+        url: { type: string, format: uri }
+        title: { type: [string, 'null'] }
+        collection_id: { type: [string, 'null'], format: uuid }
+
+    DocumentUpdate:
+      type: object
+      properties:
+        title: { type: string, minLength: 1, maxLength: 200 }
+        collection_id: { type: [string, 'null'], format: uuid }
+
+    DocumentUploadTicket:
+      type: object
+      required: [document, upload]
+      properties:
+        document: { $ref: '#/components/schemas/Document' }
+        upload:
+          type: object
+          required: [url, method, headers, expires_at]
+          properties:
+            url: { type: string, format: uri }
+            method: { type: string, const: PUT }
+            headers:
+              type: object
+              additionalProperties: { type: string }
+            expires_at: { type: string, format: date-time }
+
+    DocumentPage:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/Document' }
+        next_cursor: { type: [string, 'null'] }
+
+    Chunk:
+      type: object
+      required: [id, document_id, ordinal, content]
+      properties:
+        id: { type: string, format: uuid }
+        document_id: { type: string, format: uuid }
+        ordinal: { type: integer }
+        page: { type: [integer, 'null'] }
+        content: { type: string }
+
+    Conversation:
+      type: object
+      required: [id, title, created_at]
+      properties:
+        id: { type: string, format: uuid }
+        title: { type: string, description: Generated from the first question }
+        collection_id: { type: [string, 'null'], format: uuid }
+        created_at: { type: string, format: date-time }
+        last_message_at: { type: [string, 'null'], format: date-time }
+
+    ConversationCreate:
+      type: object
+      properties:
+        collection_id: { type: [string, 'null'], format: uuid, description: Restrict retrieval to this collection }
+
+    ConversationPage:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/Conversation' }
+        next_cursor: { type: [string, 'null'] }
+
+    QuestionCreate:
+      type: object
+      required: [content]
+      properties:
+        content: { type: string, minLength: 1, maxLength: 4000 }
+        document_ids:
+          type: array
+          description: Optional; restrict retrieval to these documents
+          items: { type: string, format: uuid }
+
+    Citation:
+      type: object
+      required: [index, document_id, chunk_id, snippet]
+      properties:
+        index: { type: integer, description: 'Matches the [n] marker in the answer text', minimum: 1 }
+        document_id: { type: string, format: uuid }
+        document_title: { type: string }
+        chunk_id: { type: string, format: uuid }
+        page: { type: [integer, 'null'] }
+        snippet: { type: string, description: First ~200 characters of the passage }
+
+    MessageUsage:
+      type: object
+      required: [input_tokens, output_tokens, latency_ms]
+      properties:
+        input_tokens: { type: integer }
+        output_tokens: { type: integer }
+        latency_ms: { type: integer, description: Request start to last token }
+
+    Message:
+      type: object
+      required: [id, role, content, created_at]
+      properties:
+        id: { type: string, format: uuid }
+        role: { type: string, enum: [user, assistant] }
+        content: { type: string }
+        citations:
+          type: array
+          items: { $ref: '#/components/schemas/Citation' }
+        usage:
+          oneOf:
+            - $ref: '#/components/schemas/MessageUsage'
+            - type: 'null'
+        created_at: { type: string, format: date-time }
+
+    MessagePage:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/Message' }
+        next_cursor: { type: [string, 'null'] }
+
+    FlashcardRequest:
+      type: object
+      properties:
+        count: { type: integer, minimum: 3, maximum: 30, default: 10 }
+
+    Flashcard:
+      type: object
+      required: [question, answer, chunk_id]
+      properties:
+        question: { type: string }
+        answer: { type: string }
+        chunk_id: { type: string, format: uuid, description: Source passage the card was built from }
+
+    FlashcardSet:
+      type: object
+      required: [document_id, cards]
+      properties:
+        document_id: { type: string, format: uuid }
+        cards:
+          type: array
+          items: { $ref: '#/components/schemas/Flashcard' }
